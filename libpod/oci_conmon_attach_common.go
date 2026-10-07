@@ -101,7 +101,22 @@ func (r *ConmonOCIRuntime) Attach(c *Container, params *AttachOptions) error {
 	if params.AttachReady != nil {
 		params.AttachReady <- true
 	}
-	return readStdio(conn, params.Streams, receiveStdoutError, stdinDone)
+
+	// readStdio waits until conmon closes the attach socket, which is after
+	// the container exits and conmon has spawned `container cleanup`. That
+	// cleanup needs this container's lock. Drop it for the wait and relock
+	// before every return so the caller still owns the lock, including when
+	// readStdio fails. Batched callers own the lock and it is not dropped.
+	// Relock before handling the error so a deferred unlock cannot run twice.
+	// Ref: GH Issue 9615, #29646
+	if !c.batched {
+		c.lock.Unlock()
+	}
+	stdioErr := readStdio(conn, params.Streams, receiveStdoutError, stdinDone)
+	if !c.batched {
+		c.lock.Lock()
+	}
+	return stdioErr
 }
 
 // Attach to the given container's exec session.

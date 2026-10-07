@@ -56,6 +56,21 @@ var _ = Describe("Podman start", func() {
 		Expect(session).To(ExitWithError(1, ""))
 	})
 
+	It("podman start --attach --rm removes an immediate-exit container", func() {
+		session := podmanTest.Podman([]string{"create", "--rm", ALPINE, "true"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		cid := session.OutputToString()
+
+		session = podmanTest.Podman([]string{"start", "--attach", cid})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		session = podmanTest.Podman([]string{"container", "exists", cid})
+		session.WaitWithDefaultTimeout()
+		Expect(session).To(ExitWithError(1, ""))
+	})
+
 	It("podman container start single container by id", func() {
 		session := podmanTest.Podman([]string{"container", "create", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()

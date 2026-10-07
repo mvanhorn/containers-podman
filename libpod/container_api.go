@@ -172,9 +172,19 @@ func (c *Container) Update(updateOptions *entities.ContainerUpdateOptions) error
 // ordering of the two such that no output from the container is lost (e.g. the
 // Attach call occurs before Start).
 func (c *Container) Attach(ctx context.Context, streams *define.AttachStreams, keys string, resize <-chan resize.TerminalSize, start bool) (retChan <-chan error, finalErr error) {
+	// locked is cleared when this goroutine drops the lock so the deferred
+	// unlock cannot run twice. The attach goroutine takes the lock itself
+	// across start; pthread mutexes must be unlocked by the goroutine that
+	// locked them. #29646 #9615
+	locked := false
 	if !c.batched {
 		c.lock.Lock()
-		defer c.lock.Unlock()
+		locked = true
+		defer func() {
+			if locked {
+				c.lock.Unlock()
+			}
+		}()
 
 		// defer's are executed LIFO so we are locked here
 		// as long as we call this after the defer unlock()
@@ -212,6 +222,16 @@ func (c *Container) Attach(ctx context.Context, streams *define.AttachStreams, k
 		}
 	}
 
+	// Drop the lock before the attach goroutine. That goroutine locks across
+	// start and drops the lock again while waiting on conmon, which is the
+	// wait that overlaps `container cleanup`. waitForHealthy stays here, on
+	// the goroutine that holds the lock, and releases it for its own wait.
+	// Batched callers own the lock, so it is not dropped.
+	if !c.batched {
+		c.lock.Unlock()
+		locked = false
+	}
+
 	attachChan := make(chan error)
 
 	// We need to ensure that we don't return until start() fired in attach.
@@ -220,6 +240,11 @@ func (c *Container) Attach(ctx context.Context, streams *define.AttachStreams, k
 
 	// Attach to the container before starting it
 	go func() {
+		if !c.batched {
+			c.lock.Lock()
+			defer c.lock.Unlock()
+		}
+
 		// Start resizing
 		if c.LogDriver() != define.PassthroughLogging && c.LogDriver() != define.PassthroughTTYLogging {
 			registerResizeFunc(resize, c.bundlePath())
@@ -242,8 +267,17 @@ func (c *Container) Attach(ctx context.Context, streams *define.AttachStreams, k
 
 	select {
 	case err := <-attachChan:
+		// Relock before returning so the deferred unlock runs once.
+		if !c.batched {
+			c.lock.Lock()
+			locked = true
+		}
 		return nil, err
 	case <-startedChan:
+		if !c.batched {
+			c.lock.Lock()
+			locked = true
+		}
 		c.newContainerEvent(events.Attach)
 	}
 

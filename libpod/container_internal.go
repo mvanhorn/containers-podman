@@ -1290,17 +1290,70 @@ func (c *Container) startNoPodLock(ctx context.Context, recursive bool) (finalEr
 	return c.waitForHealthy(ctx)
 }
 
-// Internal, non-locking function to start a container
+// Internal function to start a container.
+// The caller must hold the container lock on this goroutine.
+// When the container is not batched, the lock is dropped around the OCI start
+// and reacquired before the running state is written. A container that exits
+// immediately makes conmon spawn `podman container cleanup`, which needs this
+// same lock; holding it across the start deadlocks that cleanup (#29646).
+// Batched callers own the lock and it is not dropped.
 func (c *Container) start() error {
 	if c.config.Spec.Process != nil {
 		logrus.Debugf("Starting container %s with command %v", c.ID(), c.config.Spec.Process.Args)
 	}
 
-	if err := c.ociRuntime.StartContainer(c); err != nil {
-		return err
+	// Unlock before handing the container to the runtime, then relock before
+	// handling the error. Returning before the relock lets a deferred unlock
+	// in the caller run twice. Ref: GH Issue 9615
+	stateBeforeStart := c.state.State
+	if !c.batched {
+		c.lock.Unlock()
 	}
+
+	startErr := c.ociRuntime.StartContainer(c)
+	// StartContainer records StartedTime on the in-memory state. syncContainer
+	// replaces that state from the database, so keep the value across the sync.
+	startedTime := c.state.StartedTime
+
+	if !c.batched {
+		c.lock.Lock()
+		if err := c.syncContainer(); err != nil {
+			if errors.Is(err, define.ErrNoSuchCtr) || errors.Is(err, define.ErrCtrRemoved) {
+				// Cleanup removed the container before the running state was
+				// saved. The lock is held again, so the caller's deferred
+				// unlock runs once.
+				return err
+			}
+
+			if startErr != nil {
+				logrus.Errorf("Syncing container %s status: %v", c.ID(), err)
+				return startErr
+			}
+			return err
+		}
+	}
+
+	// We have to check startErr *after* we lock again - otherwise, we have a
+	// chance of panicking on a double-unlock. Ref: GH Issue 9615
+	if startErr != nil {
+		return startErr
+	}
+
+	// Since we're now subject to a race condition with other processes who
+	// may have altered the state (and other data), let's check if the
+	// state has changed. If so, we should return immediately and leave
+	// breadcrumbs for debugging if needed.
+	if !c.batched && c.state.State != stateBeforeStart {
+		logrus.Debugf(
+			"Container %q state changed from %q to %q while waiting for it to start: discontinuing start procedure as another process interfered",
+			c.ID(), stateBeforeStart, c.state.State,
+		)
+		return nil
+	}
+
 	logrus.Debugf("Started container %s", c.ID())
 
+	c.state.StartedTime = startedTime
 	c.state.State = define.ContainerStateRunning
 
 	// Unless being ignored, set the MAINPID to conmon.

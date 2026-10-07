@@ -1438,6 +1438,43 @@ VOLUME %s`, ALPINE, volPath, volPath)
 		Expect(numContainers).To(Equal(0))
 	})
 
+	It("podman run --rm immediate exit does not wedge the lock", func() {
+		// A lock cycle with conmon's container cleanup hangs WaitWithDefaultTimeout.
+		const parallel = 4
+		sessions := make([]*PodmanSessionIntegration, parallel)
+		for i := range sessions {
+			sessions[i] = podmanTest.Podman([]string{"run", "--rm", ALPINE, "true"})
+		}
+		for _, session := range sessions {
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+		}
+
+		ps := podmanTest.Podman([]string{"ps", "-a"})
+		ps.WaitWithDefaultTimeout()
+		Expect(ps).Should(ExitCleanly())
+		Expect(podmanTest.NumberOfContainers()).To(Equal(0))
+	})
+
+	It("podman run --rm non-zero exit still removes the container", func() {
+		session := podmanTest.Podman([]string{"run", "--rm", ALPINE, "false"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).To(ExitWithError(1, ""))
+		Expect(podmanTest.NumberOfContainers()).To(Equal(0))
+	})
+
+	It("podman run -d does not block a following ps", func() {
+		session := podmanTest.Podman([]string{"run", "-d", ALPINE, "top"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		cid := session.OutputToString()
+
+		ps := podmanTest.Podman([]string{"ps", "-q", "--no-trunc"})
+		ps.WaitWithDefaultTimeout()
+		Expect(ps).Should(ExitCleanly())
+		Expect(ps.OutputToString()).To(ContainSubstring(cid))
+	})
+
 	It("podman run after infra-container rootfs removed", func() {
 		// Regression test for #26190
 		podmanTest.PodmanExitCleanly("run", "--name", "test", "--pod", "new:foobar", ALPINE, "ls")
